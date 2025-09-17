@@ -10,6 +10,7 @@ Disesuaikan untuk deployment di Railway dengan Environment Variables.
 2.  KOMPATIBILITAS: Bot sekarang dapat membaca format data lama di `claims.json` (yang mungkin hanya memiliki `last_claim_timestamp`) tanpa error.
 3.  AUTO-MIGRASI: Saat pengguna dengan data lama berhasil melakukan klaim baru, entri mereka akan secara otomatis diperbarui ke format data yang lengkap dan terstruktur.
 4.  FITUR BARU: Menambahkan variabel environment 'ADMIN_USER_IDS' untuk mendaftarkan beberapa admin. Bot owner otomatis menjadi admin.
+5.  FIX: Menambahkan parser otomatis untuk URL repo agar tahan terhadap kesalahan format pada environment variable (memperbaiki error 404).
 """
 
 import discord
@@ -25,20 +26,45 @@ import string
 import asyncio
 from typing import List, Dict, Optional
 
+# --- [FIX] FUNGSI BARU UNTUK MEMBERSIHKAN SLUG REPO ---
+def parse_repo_slug(repo_input: str) -> str:
+    """Membersihkan input URL repo menjadi format 'owner/repo' yang valid untuk API."""
+    if not repo_input:
+        return ""
+    # Hapus prefix umum
+    for prefix in ["https://github.com/", "http://github.com/"]:
+        if repo_input.startswith(prefix):
+            repo_input = repo_input[len(prefix):]
+    
+    # Hapus suffix umum
+    if repo_input.endswith(".git"):
+        repo_input = repo_input[:-4]
+    if repo_input.endswith("/"):
+        repo_input = repo_input[:-1]
+    
+    # Ambil dua bagian terakhir dari path, yang seharusnya adalah owner/repo
+    parts = repo_input.split('/')
+    if len(parts) >= 2:
+        return f"{parts[-2]}/{parts[-1]}"
+    
+    return repo_input
+
 # --- KONFIGURASI DARI ENVIRONMENT VARIABLES ---
 DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
-PRIMARY_REPO = os.environ.get('PRIMARY_REPO')
+PRIMARY_REPO_INPUT = os.environ.get('PRIMARY_REPO', '')
+PRIMARY_REPO = parse_repo_slug(PRIMARY_REPO_INPUT) # [FIX] Terapkan pembersihan
 ALLOWED_GUILD_IDS_STR = os.environ.get('ALLOWED_GUILD_IDS', '')
 CLAIM_CHANNEL_ID = int(os.environ.get('CLAIM_CHANNEL_ID', 0))
 ROLE_REQUEST_CHANNEL_ID = int(os.environ.get('ROLE_REQUEST_CHANNEL_ID', 0))
 TOKEN_SOURCES_STR = os.environ.get('TOKEN_SOURCES', '')
-# [FITUR BARU] Tambahkan variabel untuk ID admin, pisahkan dengan koma. Contoh: "12345,67890"
 ADMIN_USER_IDS_STR = os.environ.get('ADMIN_USER_IDS', '')
 
 
 if not all([DISCORD_TOKEN, GITHUB_TOKEN, PRIMARY_REPO, ALLOWED_GUILD_IDS_STR, TOKEN_SOURCES_STR]):
     print("FATAL ERROR: Pastikan semua variabel (DISCORD_TOKEN, GITHUB_TOKEN, PRIMARY_REPO, ALLOWED_GUILD_IDS, TOKEN_SOURCES) telah diatur.")
+    if not PRIMARY_REPO:
+        print(f"FATAL ERROR: PRIMARY_REPO ('{PRIMARY_REPO_INPUT}') tidak dapat di-parse ke format 'owner/repo'.")
     exit()
 
 try:
@@ -54,8 +80,15 @@ if TOKEN_SOURCES_STR:
             alias, full_path = item.split(':', 1)
             alias = alias.strip().lower()
             parts = full_path.strip().split('/')
-            owner, repo, path = parts[0], parts[1], '/'.join(parts[2:])
-            TOKEN_SOURCES[alias] = {"slug": f"{owner}/{repo}", "path": path}
+            # [FIX] Terapkan pembersihan pada slug repo dari TOKEN_SOURCES
+            raw_slug = '/'.join(parts[:-1]) # Gabungkan bagian repo
+            path = parts[-1] # Bagian terakhir adalah path file
+            cleaned_slug = parse_repo_slug(raw_slug)
+            
+            if len(cleaned_slug.split('/')) != 2:
+                 print(f"WARNING: Slug token source '{alias}' ('{raw_slug}') mungkin tidak valid setelah di-parse.")
+
+            TOKEN_SOURCES[alias] = {"slug": cleaned_slug, "path": path}
     except Exception as e:
         print(f"FATAL ERROR: Format TOKEN_SOURCES tidak valid. Error: {e}")
         exit()
@@ -157,7 +190,6 @@ class ClaimPanelView(ui.View):
                         next_claim_time = last_claim_time + timedelta(days=7)
                         await interaction.followup.send(f"❌ **Cooldown!** Anda baru bisa klaim lagi pada {next_claim_time.strftime('%d %B %Y, %H:%M')} UTC.", ephemeral=True); return
                 
-                # [KOMPATIBILITAS] Cek semua field sebelum validasi token aktif
                 if 'current_token' in user_claim_info and 'token_expiry_timestamp' in user_claim_info and datetime.fromisoformat(user_claim_info['token_expiry_timestamp']) > current_time:
                     await interaction.followup.send(f"❌ Token Anda saat ini masih aktif.", ephemeral=True); return
 
@@ -181,7 +213,6 @@ class ClaimPanelView(ui.View):
                 await interaction.followup.send("❌ Gagal membuat token di file sumber. Silakan coba lagi.", ephemeral=True)
                 return
 
-            # [AUTO-MIGRASI] Selalu timpa data lama user dengan data baru yang lengkap
             claims_data[user_id] = {
                 "last_claim_timestamp": current_time.isoformat(), 
                 "current_token": new_token, 
@@ -221,7 +252,6 @@ class ClaimPanelView(ui.View):
         user_data = claims_data[user_id]
         embed = discord.Embed(title="📄 Detail Token Anda", color=discord.Color.blue())
         
-        # [KOMPATIBILITAS] Cek semua field sebelum menampilkan detail token
         if 'current_token' in user_data and 'token_expiry_timestamp' in user_data and datetime.fromisoformat(user_data["token_expiry_timestamp"]) > datetime.now(timezone.utc):
             embed.add_field(name="Token Aktif", value=f"`{user_data['current_token']}`", inline=False)
             embed.add_field(name="Sumber", value=f"`{user_data.get('source_alias', 'N/A').title()}`", inline=True)
@@ -388,7 +418,6 @@ async def admin_reset_cooldown(interaction: discord.Interaction, user: discord.M
         if user_id not in claims_data:
             await interaction.followup.send(f"ℹ️ {user.mention} belum pernah klaim.", ephemeral=True); return
         
-        # Hapus seluruh data pengguna, ini adalah cara paling aman
         del claims_data[user_id]
             
         if update_github_file(PRIMARY_REPO, CLAIMS_FILE_PATH, json.dumps(claims_data, indent=4), claims_sha, f"Admin: Reset data for {user.name}"):
@@ -409,7 +438,6 @@ async def admin_cek_user(interaction: discord.Interaction, user: discord.Member)
     user_data = claims_data[str(user.id)]
     embed = discord.Embed(title=f"🔍 Status Token - {user.display_name}", color=discord.Color.orange())
     
-    # [KOMPATIBILITAS] Cek semua field sebelum menampilkan detail
     if 'current_token' in user_data and 'token_expiry_timestamp' in user_data and datetime.fromisoformat(user_data["token_expiry_timestamp"]) > datetime.now(timezone.utc):
         embed.add_field(name="Token Aktif", value=f"`{user_data['current_token']}`", inline=False)
         embed.add_field(name="Sumber", value=f"`{user_data.get('source_alias', 'N/A').title()}`", inline=True)
@@ -443,7 +471,6 @@ async def list_tokens(interaction: discord.Interaction):
     embed = discord.Embed(title="Daftar Token Aktif", color=discord.Color.blue())
     active_tokens = []
     for user_id, data in claims_data.items():
-        # [KOMPATIBILITAS] Cek semua field sebelum menampilkan token
         if 'current_token' in data and 'token_expiry_timestamp' in data and datetime.fromisoformat(data["token_expiry_timestamp"]) > datetime.now(timezone.utc):
             try: 
                 user = await bot.fetch_user(int(user_id))
@@ -509,7 +536,7 @@ async def on_ready():
     print(f'Daftar Admin ID: {bot.admin_ids}')
     print(f'Repo data utama (claims): {PRIMARY_REPO}')
     print(f'Server IDs: {ALLOWED_GUILD_IDS}')
-    print(f'Sumber Token Terkonfigurasi: {len(TOKEN_SOURCES)} sumber')
+    print(f'Sumber Token Terkonfigurasi: {TOKEN_SOURCES}')
 
 @bot.event
 async def on_guild_join(guild):
