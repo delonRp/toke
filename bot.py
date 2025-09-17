@@ -289,6 +289,7 @@ async def help_command(interaction: discord.Interaction):
             "**/admin_remove_token**: Menghapus token.\n"
             "**/admin_reset_cooldown**: Mereset cooldown pengguna.\n"
             "**/admin_cek_user**: Memeriksa status pengguna.\n"
+            "**/admin_add_shared_token**: Menambah token custom dengan durasi.\n"
             "**/list_tokens**: Menampilkan semua token aktif.\n"
             "**/list_sources**: Menampilkan semua sumber token.\n"
             "**/baca_file**: Membaca file dari sumber token.\n"
@@ -377,6 +378,86 @@ async def admin_remove_token(interaction: discord.Interaction, alias: str, token
             await interaction.followup.send(f"✅ Token `{token}` dihapus dari `{alias}`.", ephemeral=True)
         else:
             await interaction.followup.send(f"❌ Gagal menghapus token dari `{alias}`.", ephemeral=True)
+
+@bot.tree.command(name="admin_add_shared_token", description="ADMIN: Menambahkan token yang bisa dibagikan dengan durasi custom.")
+@is_admin()
+@app_commands.describe(alias="Alias sumber token.", token="Token yang akan ditambahkan.", durasi="Durasi token (misal: 7d, 24h, 30m).")
+@app_commands.autocomplete(alias=source_alias_autocomplete)
+async def admin_add_shared_token(interaction: discord.Interaction, alias: str, token: str, durasi: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    # 1. Validasi Input
+    source_info = TOKEN_SOURCES.get(alias.lower())
+    if not source_info:
+        await interaction.followup.send(f"❌ Alias `{alias}` tidak valid.", ephemeral=True)
+        return
+        
+    try:
+        duration_delta = parse_duration(durasi)
+    except ValueError as e:
+        await interaction.followup.send(f"❌ Format durasi tidak valid: {e}", ephemeral=True)
+        return
+
+    # 2. Proses Transaksional
+    async with bot.github_lock:
+        target_repo_slug = source_info["slug"]
+        target_file_path = source_info["path"]
+        
+        # Langkah 2a: Tambahkan token ke file sumber
+        tokens_content, tokens_sha = get_github_file(target_repo_slug, target_file_path)
+        if token in (tokens_content or ""):
+            await interaction.followup.send(f"❌ Token `{token}` sudah ada di file sumber `{alias}`.", ephemeral=True)
+            return
+            
+        new_tokens_content = (tokens_content or "").strip() + f"\n\n{token}\n\n"
+        token_add_success = update_github_file(target_repo_slug, target_file_path, new_tokens_content, tokens_sha, f"Admin: Add shared token {token}")
+
+        if not token_add_success:
+            await interaction.followup.send("❌ Gagal menambahkan token ke file sumber. Operasi dibatalkan.", ephemeral=True)
+            return
+
+        # Langkah 2b: Tambahkan data token ke claims.json
+        claims_content, claims_sha = get_github_file(PRIMARY_REPO, CLAIMS_FILE_PATH)
+        claims_data = json.loads(claims_content if claims_content else '{}')
+        
+        # Gunakan ID unik untuk token yang bisa dibagikan agar tidak bentrok dengan ID pengguna
+        claim_key = f"shared_{token}" 
+        if claim_key in claims_data:
+            await interaction.followup.send(f"❌ Data untuk token `{token}` sudah ada di database klaim. Hapus manual jika perlu.", ephemeral=True)
+            # Rollback karena data sudah ada di claims.json tapi mungkin tidak di tokens.txt
+            lines = [line for line in new_tokens_content.split('\\n\\n') if line.strip() and line.strip() != token]
+            content_after_removal = "\\n\\n".join(lines) + ("\\n\\n" if lines else "")
+            update_github_file(target_repo_slug, target_file_path, content_after_removal, tokens_sha, f"Admin: ROLLBACK shared token {token}")
+            return
+            
+        current_time = datetime.now(timezone.utc)
+        expiry_time = current_time + duration_delta
+        
+        claims_data[claim_key] = {
+            "last_claim_timestamp": current_time.isoformat(),
+            "current_token": token,
+            "token_expiry_timestamp": expiry_time.isoformat(),
+            "source_alias": alias.lower(),
+            "is_shared": True # Penanda opsional
+        }
+        
+        claim_db_update_success = update_github_file(PRIMARY_REPO, CLAIMS_FILE_PATH, json.dumps(claims_data, indent=4), claims_sha, f"Admin: Add data for shared token {token}")
+        
+        # Langkah 2c: Rollback jika penyimpanan database gagal
+        if not claim_db_update_success:
+            print(f"KRITIS: Gagal menyimpan data klaim untuk token shared '{token}'. Melakukan rollback.")
+            current_tokens_content_rb, current_tokens_sha_rb = get_github_file(target_repo_slug, target_file_path)
+            if current_tokens_content_rb and token in current_tokens_content_rb:
+                lines = [line for line in current_tokens_content_rb.split('\\n\\n') if line.strip() and line.strip() != token]
+                content_after_removal = "\\n\\n".join(lines) + ("\\n\\n" if lines else "")
+                rollback_success = update_github_file(target_repo_slug, target_file_path, content_after_removal, current_tokens_sha_rb, f"Admin: ROLLBACK shared token {token}")
+                print(f"Status Rollback: {'Berhasil' if rollback_success else 'Gagal'}")
+            
+            await interaction.followup.send("❌ Gagal menyimpan data token ke database. Token di file sumber telah dihapus kembali.", ephemeral=True)
+            return
+
+    # 3. Kirim pesan sukses
+    await interaction.followup.send(f"✅ Token `{token}` berhasil ditambahkan ke `{alias}` dan akan aktif selama `{durasi}`.", ephemeral=True)
 
 @bot.tree.command(name="list_sources", description="ADMIN: Menampilkan semua sumber token yang terkonfigurasi.")
 @is_admin()
@@ -600,4 +681,5 @@ async def on_message(message: discord.Message):
         except Exception as e: print(f"Terjadi error saat memberikan role: {e}")
 
 bot.run(DISCORD_TOKEN)
+
 
