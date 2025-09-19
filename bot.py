@@ -233,7 +233,7 @@ class ClaimPanelView(ui.View):
                 return
 
         try:
-            await user.send(f"🎉 **Token Anda Berhasil Diklaim!**\n\n**Sumber:** `{source_alias.title()}`\n**Token Anda:** `{new_token}`\n**Role:** `{claim_role.title()}`\nAktif selama **{duration_str.replace('d', ' hari')}**.")
+            await user.send(f"🎉 **Token Anda Berhasil Diklaim!**\n\n**Sumber:** `{source_alias.title()}`\n**Token Anda:** ```{new_token}```\n**Role:** `{claim_role.title()}`\nAktif selama **{duration_str.replace('d', ' hari')}**.")
             await interaction.followup.send("✅ **Berhasil!** Token Anda telah dikirim melalui DM.", ephemeral=True)
         except discord.Forbidden:
             await interaction.followup.send("⚠️ Gagal mengirim DM. Token Anda tetap dibuat dan tersimpan.", ephemeral=True)
@@ -253,7 +253,7 @@ class ClaimPanelView(ui.View):
         embed = discord.Embed(title="📄 Detail Token Anda", color=discord.Color.blue())
         
         if 'current_token' in user_data and 'token_expiry_timestamp' in user_data and datetime.fromisoformat(user_data["token_expiry_timestamp"]) > datetime.now(timezone.utc):
-            embed.add_field(name="Token Aktif", value=f"`{user_data['current_token']}`", inline=False)
+            embed.add_field(name="Token Aktif", value=f"```{user_data['current_token']}```", inline=False)
             embed.add_field(name="Sumber", value=f"`{user_data.get('source_alias', 'N/A').title()}`", inline=True)
             expiry_time = datetime.fromisoformat(user_data["token_expiry_timestamp"])
             embed.add_field(name="Kedaluwarsa Pada", value=f"{expiry_time.strftime('%d %B %Y, %H:%M')} UTC", inline=True)
@@ -681,5 +681,6 @@ async def on_message(message: discord.Message):
         except Exception as e: print(f"Terjadi error saat memberikan role: {e}")
 
 bot.run(DISCORD_TOKEN)
+
 
 
