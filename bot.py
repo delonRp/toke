@@ -675,12 +675,13 @@ async def on_message(message: discord.Message):
         try:
             await message.author.add_roles(*final_roles_to_add, reason="Otomatis dari channel request role")
             role_names = ", ".join([f"**{r.name}**" for r in final_roles_to_add])
-            await message.reply(f"✅ Halo {message.author.mention}, Anda telah menerima role: {role_names}!, Silahkan Download Filenya di <#1418411872893272164>", delete_after=25)
+            await message.reply(f"✅ Halo {message.author.mention}, Anda telah menerima role: {role_names}!, Silahkan Download Filenya di <#1418411872893272164>")
             await message.add_reaction('✅')
         except discord.Forbidden: print(f"GAGAL: Bot tidak memiliki izin 'Manage Roles'.")
         except Exception as e: print(f"Terjadi error saat memberikan role: {e}")
 
 bot.run(DISCORD_TOKEN)
+
 
 
 
