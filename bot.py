@@ -11,11 +11,13 @@ Disesuaikan untuk deployment di Railway dengan Environment Variables.
 3.  AUTO-MIGRASI: Saat pengguna dengan data lama berhasil melakukan klaim baru, entri mereka akan secara otomatis diperbarui ke format data yang lengkap dan terstruktur.
 4.  FITUR BARU: Menambahkan variabel environment 'ADMIN_USER_IDS' untuk mendaftarkan beberapa admin. Bot owner otomatis menjadi admin.
 5.  FIX: Menambahkan parser otomatis untuk URL repo agar tahan terhadap kesalahan format pada environment variable (memperbaiki error 404).
+6.  OPTIMASI: Perintah /list_tokens dioptimalkan untuk menghindari kelambatan.
+7.  FITUR BARU: Tugas latar belakang untuk membersihkan token yang kedaluwarsa secara otomatis.
 """
 
 import discord
 from discord import app_commands, ui
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 import requests
 import base64
@@ -420,10 +422,10 @@ async def admin_add_shared_token(interaction: discord.Interaction, alias: str, t
         claims_content, claims_sha = get_github_file(PRIMARY_REPO, CLAIMS_FILE_PATH)
         claims_data = json.loads(claims_content if claims_content else '{}')
         
-        # Gunakan ID unik untuk token yang bisa dibagikan agar tidak bentrok dengan ID pengguna
-        claim_key = f"shared_{token}" 
+        # [FIX] Gunakan ID unik dengan alias agar tidak bentrok
+        claim_key = f"shared_{alias.lower()}_{token}" 
         if claim_key in claims_data:
-            await interaction.followup.send(f"❌ Data untuk token `{token}` sudah ada di database klaim. Hapus manual jika perlu.", ephemeral=True)
+            await interaction.followup.send(f"❌ Data untuk token `{token}` di sumber `{alias}` sudah ada di database klaim. Hapus manual jika perlu.", ephemeral=True)
             # Rollback karena data sudah ada di claims.json tapi mungkin tidak di tokens.txt
             lines = [line for line in new_tokens_content.split('\\n\\n') if line.strip() and line.strip() != token]
             content_after_removal = "\\n\\n".join(lines) + ("\\n\\n" if lines else "")
@@ -543,6 +545,13 @@ async def admin_cek_user(interaction: discord.Interaction, user: discord.Member)
 @is_admin()
 async def list_tokens(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+    
+    # [OPTIMASI] Tambahkan pengecekan guild
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("Perintah ini harus dijalankan di dalam server.", ephemeral=True)
+        return
+
     claims_content, _ = get_github_file(PRIMARY_REPO, CLAIMS_FILE_PATH)
     claims_data = json.loads(claims_content if claims_content else '{}')
 
@@ -551,14 +560,21 @@ async def list_tokens(interaction: discord.Interaction):
 
     embed = discord.Embed(title="Daftar Token Aktif", color=discord.Color.blue())
     active_tokens = []
-    for user_id, data in claims_data.items():
-        if 'current_token' in data and 'token_expiry_timestamp' in data and datetime.fromisoformat(data["token_expiry_timestamp"]) > datetime.now(timezone.utc):
-            try: 
-                user = await bot.fetch_user(int(user_id))
-                username = str(user)
-            except (discord.NotFound, ValueError): 
-                username = f"ID: {user_id}"
+    current_time = datetime.now(timezone.utc)
+
+    for key, data in claims_data.items():
+        if 'current_token' in data and 'token_expiry_timestamp' in data and datetime.fromisoformat(data["token_expiry_timestamp"]) > current_time:
+            username = f"Shared Key: {key}" # Default untuk shared token
+            if key.isdigit():
+                # [OPTIMASI] Gunakan get_member dari cache, jauh lebih cepat
+                member = guild.get_member(int(key))
+                if member:
+                    username = str(member)
+                else:
+                    username = f"User ID: {key} (Not in server)"
+            
             active_tokens.append(f"**{username}**: `{data['current_token']}` (Sumber: {data.get('source_alias', 'N/A').title()})")
+
     embed.description = "\n".join(active_tokens) if active_tokens else "Tidak ada token yang sedang aktif."
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -577,6 +593,78 @@ async def serverlist(interaction: discord.Interaction):
     server_list = [f"- **{guild.name}** (ID: `{guild.id}`)" for guild in bot.guilds]
     embed = discord.Embed(title=f"Bot Aktif di {len(bot.guilds)} Server", description="\n".join(server_list), color=0x3498db)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# --- [FITUR BARU] BACKGROUND TASK UNTUK MEMBERSIHKAN TOKEN KEDALUWARSA ---
+@tasks.loop(hours=1)
+async def cleanup_expired_tokens():
+    await bot.wait_until_ready() # Pastikan bot sudah siap sebelum menjalankan
+    print(f"[{datetime.now()}] Menjalankan tugas pembersihan token kedaluwarsa...")
+    async with bot.github_lock:
+        claims_content, claims_sha = get_github_file(PRIMARY_REPO, CLAIMS_FILE_PATH)
+        if not claims_content:
+            print("Pembersihan dibatalkan: Gagal membaca claims.json.")
+            return
+
+        try:
+            claims_data = json.loads(claims_content)
+        except json.JSONDecodeError:
+            print("Pembersihan dibatalkan: claims.json rusak atau kosong.")
+            return
+
+        current_time = datetime.now(timezone.utc)
+        keys_to_process = list(claims_data.keys()) # Salin kunci untuk iterasi aman
+        tokens_to_remove_by_source = {}
+        claims_updated = False
+
+        for key in keys_to_process:
+            data = claims_data.get(key)
+            if data and "token_expiry_timestamp" in data:
+                try:
+                    expiry_time = datetime.fromisoformat(data["token_expiry_timestamp"])
+                except ValueError:
+                    continue # Lewati entri dengan format timestamp yang salah
+                
+                if current_time > expiry_time:
+                    claims_updated = True
+                    token = data.get("current_token")
+                    alias = data.get("source_alias")
+
+                    if token and alias and alias in TOKEN_SOURCES:
+                        if alias not in tokens_to_remove_by_source:
+                            tokens_to_remove_by_source[alias] = {
+                                "slug": TOKEN_SOURCES[alias]["slug"],
+                                "path": TOKEN_SOURCES[alias]["path"],
+                                "tokens": set()
+                            }
+                        tokens_to_remove_by_source[alias]["tokens"].add(token)
+
+                    # Hapus data token dari claims_data
+                    if key.startswith("shared_"):
+                        del claims_data[key]
+                    else:
+                        data.pop("current_token", None)
+                        data.pop("token_expiry_timestamp", None)
+                        data.pop("source_alias", None)
+        
+        if not claims_updated:
+            print("Tidak ada token kedaluwarsa yang ditemukan.")
+            return
+
+        # Hapus token dari file sumber di GitHub
+        for alias, info in tokens_to_remove_by_source.items():
+            content, sha = get_github_file(info["slug"], info["path"])
+            if content:
+                lines = content.split('\n\n')
+                new_lines = [line for line in lines if line.strip() and line.strip() not in info["tokens"]]
+                new_content = "\n\n".join(new_lines) + ("\n\n" if new_lines else "")
+
+                if new_content != content:
+                    update_github_file(info["slug"], info["path"], new_content, sha, f"Bot: Hapus token kedaluwarsa otomatis")
+                    print(f"{len(info['tokens'])} token kedaluwarsa dihapus dari sumber: {alias}")
+
+        # Update claims.json
+        update_github_file(PRIMARY_REPO, CLAIMS_FILE_PATH, json.dumps(claims_data, indent=4), claims_sha, "Bot: Bersihkan data klaim token kedaluwarsa")
+        print("Pembersihan data di claims.json selesai.")
 
 # --- EVENT & LOOP ---
 @bot.event
@@ -612,6 +700,11 @@ async def on_ready():
 
     bot.add_view(ClaimPanelView(bot))
     await bot.tree.sync()
+    
+    # [FITUR BARU] Mulai background task
+    if not cleanup_expired_tokens.is_running():
+        cleanup_expired_tokens.start()
+        
     print(f'Bot telah login sebagai {bot.user.name}')
     print(f'Owner ID: {bot.owner_id}')
     print(f'Daftar Admin ID: {bot.admin_ids}')
@@ -630,9 +723,13 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.CheckFailure):
         await interaction.response.send_message("❌ **Akses Ditolak!** Perintah ini hanya untuk admin bot.", ephemeral=True)
     else:
-        print(f"Error tidak terduga pada perintah '{interaction.command.name}': {error}")
+        print(f"Error tidak terduga pada perintah '{interaction.command.name if interaction.command else 'N/A'}': {error}")
         if not interaction.response.is_done():
-            await interaction.response.send_message("Terjadi error internal saat menjalankan perintah.", ephemeral=True)
+            try:
+                await interaction.response.send_message("Terjadi error internal saat menjalankan perintah.", ephemeral=True)
+            except discord.InteractionResponded:
+                await interaction.followup.send("Terjadi error internal saat menjalankan perintah.", ephemeral=True)
+
 
 # Logika on_message untuk role otomatis (tidak diubah)
 @bot.event
@@ -681,9 +778,3 @@ async def on_message(message: discord.Message):
         except Exception as e: print(f"Terjadi error saat memberikan role: {e}")
 
 bot.run(DISCORD_TOKEN)
-
-
-
-
-
-
